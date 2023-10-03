@@ -8,10 +8,10 @@ BINARIES = $(patsubst %.c,%,$(SOURCE))
 all: $(BINARIES)
 
 %: %.c
-	$(CC) $(CC_FLAGS) $(LD_FLAGS) $^ -o $@
+	$(CC) $(CC_FLAGS)  $^ -o $@ $(LD_FLAGS)
 
 run: parte4
-	mpiexec --oversubscribe -n 3 $^ $^.input
+	mpiexec -n 3 ./$^ $^.input
 
 clean:
 	rm -rf $(BINARIES)
