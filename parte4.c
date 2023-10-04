@@ -123,17 +123,13 @@ void dequeue(Queue* queue, Message *msg) {
     pthread_mutex_unlock(&queue->mutex);
 }
 
-void Send(Message* msg, void *i) {
-    Queue **queues = (Queue **)i;
-    Queue *output_q = queues[1];
+void Send(Message* msg, Queue *queue) {
     clock_event();
     copy_clock(global_clock, msg->clock);
-    enqueue(output_q, *msg);
+    enqueue(queue, *msg);
 }
 
-void Receive(Message* msg, void *i) {
-    Queue **queues = (Queue **)i;
-    Queue *input_q = queues[0];
+void Receive(Message* msg) {
     sync_clock(global_clock, msg->clock);
     clock_event();
 }
@@ -155,19 +151,18 @@ void *input_task(void *i) {
 
 void *clock_task(void *i) {
     Queue **queues = (Queue **)i;
-    Queue *input_q = queues[0];
     Message msg;
     while (1) {
-        dequeue(input_q, &msg);
+        dequeue(queues[0], &msg);
         switch (msg.type) {
             case event:
                 clock_event();
                 break;
             case send:
-                Send(&msg, i);
+                Send(&msg, queues[1]);
                 break;
             case receive:
-                Receive(&msg, i);
+                Receive(&msg);
                 break;
         }
         print_clock(global_clock);
