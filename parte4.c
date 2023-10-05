@@ -4,13 +4,20 @@
 #include <pthread.h>
 #include <mpi.h>
 
+#define NOT_RECORDING (-1)
 #define NUM_THREADS 3
+#define MARKER_VAL (-1)
+
+//////////////////////////////////////////////////
+// Types
+//////////////////////////////////////////////////
 
 typedef enum _ActionType {
     event,
     receive,
     send,
-    snapshot
+    snapshot, // inicializar snapshot
+    marker
 } ActionType;
 
 typedef struct _Action {
@@ -27,44 +34,53 @@ typedef struct _Queue {
     pthread_cond_t cond_empty;
 } Queue;
 
-// global process info
+//////////////////////////////////////////////////
+// Globals and other utilities
+//////////////////////////////////////////////////
+
 int rank, comm_sz, *global_clock;
-Queue input_queue, output_queue;
+int has_seen_marker;
+pthread_mutex_t seen_lock = PTHREAD_MUTEX_INITIALIZER;
+int *channels;
+pthread_mutex_t channels_lock = PTHREAD_MUTEX_INITIALIZER;
+Queue *input_queue, *output_queue, *marker_queue;
 int queue_size, num_actions;
 FILE *input;
 
 #define SUCCESS 1
 #define FAILURE 0
 #define MAX_LINE_LENGTH 100
-int read_input_action(Action *action) {
+int read_input_action(Action *action_p) {
     char line[MAX_LINE_LENGTH], action[MAX_LINE_LENGTH];
     int action_rank, isEOF;
     do {
         fgets(line, MAX_LINE_LENGTH, input);
         isEOF = feof(input);
         sscanf(line, "%d %s", &action_rank);
-    } while ((action_rank != rank || strcmp(action, "snapshot") == 0)
-              && (!isEOF));
+    } while (action_rank != rank && (!isEOF));
     if (!isEOF) {
         if (strcmp(action, "event") == 0) {
-            action->type = event;
+            action_p->type = event;
         }
         else if (strcmp(action, "snapshot") == 0) {
-            action->type = snapshot;
-            action->target = action_rank;
+            action_p->type = snapshot;
         }
         else if (strcmp(action, "send") == 0) {
-            action->type = send;
-            sscanf(line, "%*d send %d", &action->target);
+            action_p->type = send;
+            sscanf(line, "%*d send %d", &action_p->target);
         }
         else if (strcmp(action, "receive") == 0) {
-            action->type = receive;
-            sscanf(line, "%*d receive %d", &action->target);
+            action_p->type = receive;
+            sscanf(line, "%*d receive %d", &action_p->target);
         }
         return SUCCESS;
     }
     return FAILURE;
 }
+
+//////////////////////////////////////////////////
+// Clock operations
+//////////////////////////////////////////////////
 
 void clock_event(void) {
     global_clock[rank]++;
@@ -87,12 +103,28 @@ void print_clock(int *clock) {
     printf("process %d: (%d, %d, %d)\n", rank, clock[0], clock[1], clock[2]);
 }
 
+int is_marker(int *clock) {
+    return clock[0] == MARKER_VAL;
+}
+
+//////////////////////////////////////////////////
+// Queue operations
+//////////////////////////////////////////////////
+
 void init_queue(Queue* queue) {
     queue->actions = malloc(sizeof(Action) * queue_size);
     pthread_mutex_init(&queue->mutex, NULL);
     pthread_cond_init(&queue->cond_full, NULL);
     pthread_cond_init(&queue->cond_empty, NULL);
 }
+
+int is_empty(Queue *queue) {
+    pthread_mutex_lock(&queue->mutex);
+    int res = queue->counter == 0;
+    pthread_mutex_unlock(&queue->mutex);
+    return res;
+}
+
 
 void enqueue(Queue* queue, Action action) {
     pthread_mutex_lock(&queue->mutex);
@@ -128,60 +160,148 @@ void dequeue(Queue* queue, Action *action) {
     pthread_mutex_unlock(&queue->mutex);
 }
 
-void Send(Action* action, Queue *queue) {
-    clock_event();
-    copy_clock(global_clock, action->clock);
-    enqueue(queue, *action);
+//////////////////////////////////////////////////
+// Snapshot
+//////////////////////////////////////////////////
+
+int check_marker_seen(void) {
+    pthread_mutex_lock(&seen_lock);
+    int res = has_seen_marker;
+    pthread_mutex_unlock(&seen_lock);
+    return res;
 }
 
-void Receive(Action* action) {
-    sync_clock(global_clock, action->clock);
-    clock_event();
+void make_marker_seen(void) {
+    pthread_mutex_lock(&seen_lock);
+    has_seen_marker = 1;
+    pthread_mutex_unlock(&seen_lock);
 }
+
+void record_state(void) {
+    printf("State of ");
+    print_clock(global_clock);
+}
+
+void close_channel(int i, char *label) {
+    pthread_mutex_lock(&channels_lock);
+    channels[i] = NOT_RECORDING;
+    printf("Channel C%d,%d: %s\n", i, rank, label);
+    pthread_mutex_unlock(&channels_lock);
+}
+
+void emit_marker(void) {
+    Action action;
+    action.type = marker;
+    action.clock = malloc(sizeof(int) * comm_sz);
+    action.clock[0] = MARKER_VAL;
+    action.clock[1] = rank;
+    enqueue(output_queue, action);
+}
+
+int get_marker_sender(int *clock) {
+    return clock[1];
+}
+
+void first_marker(int sender) {
+    record_state();
+    close_channel(sender, "EMPTY");
+    emit_marker();
+    make_marker_seen();
+}
+
+void another_marker(int sender) {
+    close_channel(sender, "FINALIZED");
+}
+
+void start_snapshot() {
+    record_state();
+    emit_marker();
+}
+
+//////////////////////////////////////////////////
+// Threads
+//////////////////////////////////////////////////
 
 void *input_task(void *i) {
-    Queue *queue = (Queue *)i;
     Action action;
+    Queue *q;
     action.clock = malloc(sizeof(int) * comm_sz);
-    while (read_input_action(&action) == SUCCESS) {
-        if (action.type == receive) {
-            MPI_Recv(action.clock, comm_sz, MPI_INT, 
-                    action.target, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
-        }
-        enqueue(queue, action);
+    while (1) {
+        MPI_Recv(action.clock, comm_sz, MPI_INT,
+                MPI_ANY_SOURCE, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+        q = is_marker(action.clock) ? marker_queue : input_queue;
+        enqueue(q, action);
         action.clock = malloc(sizeof(int) * comm_sz);
     }
     return NULL;
 }
 
+void Send(Action* action) {
+    action->clock = malloc(sizeof(int) * comm_sz);
+    clock_event();
+    copy_clock(global_clock, action->clock);
+    enqueue(output_queue, *action);
+}
+
+void Receive(Action* action) {
+    dequeue(input_queue, action);
+    sync_clock(global_clock, action->clock);
+    clock_event();
+}
+
 void *clock_task(void *i) {
-    Queue **queues = (Queue **)i;
     Action action;
     while (1) {
-        dequeue(queues[0], &action);
-        switch (action.type) {
-            case event:
-                clock_event();
-                break;
-            case send:
-                Send(&action, queues[1]);
-                break;
-            case receive:
-                Receive(&action);
-                break;
+        if (!is_empty(marker_queue)) {
+            dequeue(marker_queue, &action);
+            int sender = get_marker_sender(action.clock);
+            int marker_seen = check_marker_seen();
+            if (marker_seen) {
+                another_marker(sender);
+            }
+            else {
+                first_marker(sender);
+            }
         }
-        print_clock(global_clock);
+        if (read_input_action(&action) == SUCCESS) {
+            switch (action.type) {
+                case event:
+                    clock_event();
+                    break;
+                case send:
+                    Send(&action);
+                    break;
+                case receive:
+                    Receive(&action);
+                    break;
+                case snapshot:
+                    start_snapshot();
+                    break;
+            }
+            print_clock(global_clock);
+        }
     }
 }
 
 void *output_task(void *i) {
-    Queue *queue = (Queue *)i;
     Action action;
     while (1) {
-        dequeue(queue, &action);
-        MPI_Send(action.clock, comm_sz, MPI_INT, action.target, 0, MPI_COMM_WORLD);
+        dequeue(output_queue, &action);
+        switch (action.type) {
+            case receive:
+                MPI_Send(action.clock, comm_sz, MPI_INT,
+                        action.target, 0, MPI_COMM_WORLD);
+                break;
+            case marker:
+                MPI_Bcast(action.clock, comm_sz, MPI_INT, rank, MPI_COMM_WORLD);
+                break;
+        }
     }
 }
+
+//////////////////////////////////////////////////
+// Main
+//////////////////////////////////////////////////
 
 int main(int argc, char **argv) {
     // IO startup
@@ -197,14 +317,14 @@ int main(int argc, char **argv) {
     // globals startup
     fscanf(input, "%d\n", &queue_size);
     global_clock = calloc(comm_sz, sizeof(int));
-    init_queue(&input_queue);
-    init_queue(&output_queue);
+    init_queue(input_queue);
+    init_queue(output_queue);
+    init_queue(marker_queue);
     // threads startup
     pthread_t threads[NUM_THREADS];
-    Queue* queues[2] = {&input_queue, &output_queue};
-    pthread_create(&threads[0], NULL, input_task, (void *)&input_queue);
-    pthread_create(&threads[1], NULL, clock_task, (void *)queues);
-    pthread_create(&threads[2], NULL, output_task, (void *)&output_queue);
+    pthread_create(&threads[0], NULL, input_task, NULL);
+    pthread_create(&threads[1], NULL, clock_task, NULL);
+    pthread_create(&threads[2], NULL, output_task,NULL);
     for (size_t i = 0; i < NUM_THREADS; i++) {
         pthread_join(threads[i], NULL);
     }
