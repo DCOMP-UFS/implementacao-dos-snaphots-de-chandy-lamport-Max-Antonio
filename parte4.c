@@ -6,21 +6,22 @@
 
 #define NUM_THREADS 3
 
-typedef enum _MessageType {
+typedef enum _ActionType {
     event,
     receive,
-    send
-} MessageType;
+    send,
+    snapshot
+} ActionType;
 
-typedef struct _Message {
+typedef struct _Action {
     int *clock;
     int target;
-    MessageType type;
-} Message;
+    ActionType type;
+} Action;
 
 typedef struct _Queue {
     int counter;
-    Message *msgs;
+    Action *actions;
     pthread_mutex_t mutex;
     pthread_cond_t cond_full;
     pthread_cond_t cond_empty;
@@ -35,26 +36,30 @@ FILE *input;
 #define SUCCESS 1
 #define FAILURE 0
 #define MAX_LINE_LENGTH 100
-int read_input_action(Message *msg) {
+int read_input_action(Action *action) {
     char line[MAX_LINE_LENGTH], action[MAX_LINE_LENGTH];
     int action_rank, isEOF;
     do {
         fgets(line, MAX_LINE_LENGTH, input);
         isEOF = feof(input);
-        sscanf(line, "%d", &action_rank);
-        sscanf(line, "%*d %s", action);
-    } while (action_rank != rank && (!isEOF));
+        sscanf(line, "%d %s", &action_rank);
+    } while ((action_rank != rank || strcmp(action, "snapshot") == 0)
+              && (!isEOF));
     if (!isEOF) {
         if (strcmp(action, "event") == 0) {
-            msg->type = event;
+            action->type = event;
+        }
+        else if (strcmp(action, "snapshot") == 0) {
+            action->type = snapshot;
+            action->target = action_rank;
         }
         else if (strcmp(action, "send") == 0) {
-            msg->type = send;
-            sscanf(line, "%*d send %d", &msg->target);
+            action->type = send;
+            sscanf(line, "%*d send %d", &action->target);
         }
         else if (strcmp(action, "receive") == 0) {
-            msg->type = receive;
-            sscanf(line, "%*d receive %d", &msg->target);
+            action->type = receive;
+            sscanf(line, "%*d receive %d", &action->target);
         }
         return SUCCESS;
     }
@@ -83,18 +88,18 @@ void print_clock(int *clock) {
 }
 
 void init_queue(Queue* queue) {
-    queue->msgs = malloc(sizeof(Message) * queue_size);
+    queue->actions = malloc(sizeof(Action) * queue_size);
     pthread_mutex_init(&queue->mutex, NULL);
     pthread_cond_init(&queue->cond_full, NULL);
     pthread_cond_init(&queue->cond_empty, NULL);
 }
 
-void enqueue(Queue* queue, Message msg) {
+void enqueue(Queue* queue, Action action) {
     pthread_mutex_lock(&queue->mutex);
     if (queue->counter > queue_size) {
         pthread_cond_wait(&queue->cond_full, &queue->mutex);
     }
-    queue->msgs[queue->counter++] = msg;
+    queue->actions[queue->counter++] = action;
     if (queue->counter == 1) {
         // not empty anymore
         pthread_cond_signal(&queue->cond_empty);
@@ -104,17 +109,17 @@ void enqueue(Queue* queue, Message msg) {
 
 void shift_queue(Queue* queue) {
     for (size_t i = 1; i < queue->counter; i++) {
-        queue->msgs[i-1] = queue->msgs[i];
+        queue->actions[i-1] = queue->actions[i];
     }
     queue->counter--;
 }
 
-void dequeue(Queue* queue, Message *msg) {
+void dequeue(Queue* queue, Action *action) {
     pthread_mutex_lock(&queue->mutex);
     if (queue->counter == 0) {
         pthread_cond_wait(&queue->cond_empty, &queue->mutex);
     }
-    *msg = queue->msgs[0];
+    *action = queue->actions[0];
     shift_queue(queue);
     if (queue->counter == queue_size) {
         // not full anymore
@@ -123,46 +128,46 @@ void dequeue(Queue* queue, Message *msg) {
     pthread_mutex_unlock(&queue->mutex);
 }
 
-void Send(Message* msg, Queue *queue) {
+void Send(Action* action, Queue *queue) {
     clock_event();
-    copy_clock(global_clock, msg->clock);
-    enqueue(queue, *msg);
+    copy_clock(global_clock, action->clock);
+    enqueue(queue, *action);
 }
 
-void Receive(Message* msg) {
-    sync_clock(global_clock, msg->clock);
+void Receive(Action* action) {
+    sync_clock(global_clock, action->clock);
     clock_event();
 }
 
 void *input_task(void *i) {
     Queue *queue = (Queue *)i;
-    Message msg;
-    msg.clock = malloc(sizeof(int) * comm_sz);
-    while (read_input_action(&msg) == SUCCESS) {
-        if (msg.type == receive) {
-            MPI_Recv(msg.clock, comm_sz, MPI_INT, 
-                    msg.target, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+    Action action;
+    action.clock = malloc(sizeof(int) * comm_sz);
+    while (read_input_action(&action) == SUCCESS) {
+        if (action.type == receive) {
+            MPI_Recv(action.clock, comm_sz, MPI_INT, 
+                    action.target, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
         }
-        enqueue(queue, msg);
-        msg.clock = malloc(sizeof(int) * comm_sz);
+        enqueue(queue, action);
+        action.clock = malloc(sizeof(int) * comm_sz);
     }
     return NULL;
 }
 
 void *clock_task(void *i) {
     Queue **queues = (Queue **)i;
-    Message msg;
+    Action action;
     while (1) {
-        dequeue(queues[0], &msg);
-        switch (msg.type) {
+        dequeue(queues[0], &action);
+        switch (action.type) {
             case event:
                 clock_event();
                 break;
             case send:
-                Send(&msg, queues[1]);
+                Send(&action, queues[1]);
                 break;
             case receive:
-                Receive(&msg);
+                Receive(&action);
                 break;
         }
         print_clock(global_clock);
@@ -171,10 +176,10 @@ void *clock_task(void *i) {
 
 void *output_task(void *i) {
     Queue *queue = (Queue *)i;
-    Message msg;
+    Action action;
     while (1) {
-        dequeue(queue, &msg);
-        MPI_Send(msg.clock, comm_sz, MPI_INT, msg.target, 0, MPI_COMM_WORLD);
+        dequeue(queue, &action);
+        MPI_Send(action.clock, comm_sz, MPI_INT, action.target, 0, MPI_COMM_WORLD);
     }
 }
 
