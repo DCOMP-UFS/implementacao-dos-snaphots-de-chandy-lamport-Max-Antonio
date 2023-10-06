@@ -10,4 +10,5 @@
 2 receive 0
 0 receive 2
 0 send 1
+1 receive 0
 0 event
